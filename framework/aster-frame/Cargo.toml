@@ -19,6 +19,7 @@ inherit-methods-macro = { git = "https://github.com/asterinas/inherit-methods-ma
 int-to-c-enum = { path = "../../kernel/libs/int-to-c-enum" }
 intrusive-collections = "0.9.5"
 ktest = { path = "../libs/ktest" }
+local-alloc-macro = { path = "../libs/local-alloc-macro" }
 lazy_static = { version = "1.0", features = ["spin_no_std"] }
 log = "0.4"
 pod = { git = "https://github.com/asterinas/pod", rev = "d7dba56" }

@@ -8,10 +8,11 @@ use core::{
 };
 
 use buddy_system_allocator::FrameAllocator;
+use local_alloc_macro::local_alloc_disabled;
 
-use crate::{sync::SpinLock, task::PerTaskMap, vm::hierarchical_heap_allocator::prev_power_of_two};
-
-pub static LOCAL_ALLOC_ENABLED: AtomicBool = AtomicBool::new(true);
+use crate::{
+    cpu_local, sync::SpinLock, task::PerTaskMap, vm::hierarchical_heap_allocator::prev_power_of_two,
+};
 
 pub(super) struct HierarchicalFrameAllocator<const ORDER: usize = 32> {
     global_frame_allocator: SpinLock<GlobalFrameAllocator<ORDER>>,
@@ -34,7 +35,7 @@ impl<const ORDER: usize> HierarchicalFrameAllocator<ORDER> {
     /// Choose whether to allocate memory from local or global allocator based on the current
     /// task ID and LOCAL_ALLOC_ENABLED tag.
     pub fn alloc(&self, count: usize) -> Option<usize> {
-        if LOCAL_ALLOC_ENABLED.load(SeqCst) {
+        if is_local_alloc_enabled() {
             if !self.local_frame_allocators.local_exists() {
                 self.local_frame_allocators
                     .local_insert(LocalFrameAllocator::new());
@@ -50,7 +51,7 @@ impl<const ORDER: usize> HierarchicalFrameAllocator<ORDER> {
     /// The allocators selected by alloc and dealloc must be the same, if they are not, an error
     /// will be reported in the corresponding dealloc function
     pub fn dealloc(&self, start_frame: usize, count: usize) {
-        if LOCAL_ALLOC_ENABLED.load(SeqCst) {
+        if is_local_alloc_enabled() {
             return self
                 .local_frame_allocators
                 .local_mut()
@@ -301,5 +302,31 @@ impl<const ORDER: usize> LocalFrameAllocator<ORDER> {
             }
         }
         frames
+    }
+}
+
+pub fn is_local_alloc_enabled() -> bool {
+    LOCAL_ALLOC_ENABLED.load(SeqCst)
+}
+
+cpu_local! {
+    static LOCAL_ALLOC_ENABLED: AtomicBool = AtomicBool::new(true);
+}
+
+pub struct LocalAllocGuard {
+    old_value: bool,
+}
+
+impl LocalAllocGuard {
+    fn new() -> Self {
+        LocalAllocGuard {
+            old_value: LOCAL_ALLOC_ENABLED.fetch_and(false, SeqCst),
+        }
+    }
+}
+
+impl Drop for LocalAllocGuard {
+    fn drop(&mut self) {
+        LOCAL_ALLOC_ENABLED.store(self.old_value, SeqCst);
     }
 }

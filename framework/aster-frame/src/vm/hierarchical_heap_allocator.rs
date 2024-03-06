@@ -4,22 +4,19 @@ use core::{
     mem::size_of,
     ops::{Deref, DerefMut},
     ptr::NonNull,
-    sync::atomic::Ordering::SeqCst,
 };
 
 use align_ext::AlignExt;
 use buddy_system_allocator::{linked_list, Heap};
 
+use super::hierarchical_frame_allocator::is_local_alloc_enabled;
 use crate::{
     config::{KERNEL_HEAP_SIZE, PAGE_SIZE},
     prelude::*,
     sync::SpinLock,
     task::PerTaskMap,
     trap::disable_local,
-    vm::{
-        frame_allocator::FRAME_ALLOCATOR, hierarchical_frame_allocator::LOCAL_ALLOC_ENABLED,
-        paddr_to_vaddr, vaddr_to_paddr,
-    },
+    vm::{frame_allocator::FRAME_ALLOCATOR, paddr_to_vaddr, vaddr_to_paddr},
     Error,
 };
 
@@ -59,6 +56,7 @@ impl<const ORDER: usize> HierarchicalHeapAllocator<ORDER> {
             .init(start as usize, size);
     }
 
+    #[local_alloc_disabled]
     fn rescue(&self, layout: &Layout) -> Result<()> {
         // TODO: Optimize the allocation method with fixed threshold
         const MIN_NUM_LOCAL_FRAMES: usize = 0x800000 / PAGE_SIZE; // 8MB
@@ -91,7 +89,7 @@ impl<const ORDER: usize> HierarchicalHeapAllocator<ORDER> {
         let vaddr = paddr_to_vaddr(allocation_start * PAGE_SIZE);
 
         // local heap
-        if LOCAL_ALLOC_ENABLED.load(SeqCst) {
+        if is_local_alloc_enabled() {
             unsafe {
                 self.local_heap
                     .local_mut()
@@ -112,7 +110,7 @@ impl<const ORDER: usize> HierarchicalHeapAllocator<ORDER> {
 unsafe impl<const ORDER: usize> GlobalAlloc for HierarchicalHeapAllocator<ORDER> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let _guard = disable_local();
-        if LOCAL_ALLOC_ENABLED.load(SeqCst) {
+        if is_local_alloc_enabled() {
             if !self.local_heap.local_exists() {
                 self.local_heap.local_insert(LocalHeapAllocator::new());
             }
@@ -153,7 +151,7 @@ unsafe impl<const ORDER: usize> GlobalAlloc for HierarchicalHeapAllocator<ORDER>
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if LOCAL_ALLOC_ENABLED.load(SeqCst) {
+        if is_local_alloc_enabled() {
             self.local_heap
                 .local_mut()
                 .dealloc(NonNull::new_unchecked(ptr), layout);

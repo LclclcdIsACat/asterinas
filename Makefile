@@ -87,6 +87,7 @@ NON_OSDK_CRATES := \
 OSDK_CRATES := \
 	framework/aster-frame \
 	framework/libs/linux-bzimage/setup \
+	framework/libs/local-alloc-macro \
 	kernel \
 	kernel/aster-nix \
 	kernel/comps/block \

@@ -27,6 +27,7 @@ use spin::Once;
 pub use self::{
     dma::{DmaCoherent, DmaDirection, DmaStream, HasDaddr},
     frame::{VmFrame, VmFrameVec, VmFrameVecIter, VmReader, VmSegment, VmWriter},
+    hierarchical_frame_allocator::LocalAllocGuard,
     io::VmIo,
     memory_set::{MapArea, MemorySet},
     options::VmAllocOptions,

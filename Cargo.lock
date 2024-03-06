@@ -114,6 +114,7 @@ dependencies = [
  "ktest",
  "lazy_static",
  "linux-boot-params",
+ "local-alloc-macro",
  "log",
  "multiboot2",
  "pod",
@@ -901,6 +902,14 @@ dependencies = [
  "uefi-services",
  "x86_64",
  "xmas-elf 0.8.0",
+]
+
+[[package]]
+name = "local-alloc-macro"
+version = "0.1.0"
+dependencies = [
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]

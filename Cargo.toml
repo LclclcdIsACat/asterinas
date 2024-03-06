@@ -7,6 +7,7 @@ members = [
     "framework/libs/linux-bzimage/builder",
     "framework/libs/linux-bzimage/boot-params",
     "framework/libs/linux-bzimage/setup",
+    "framework/libs/local-alloc-macro",
     "framework/libs/ktest",
     "framework/libs/ktest-proc-macro",
     "framework/libs/tdx-guest",
