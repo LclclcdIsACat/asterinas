@@ -60,7 +60,7 @@ pub fn init() {
         td_info.gpaw,
         td_info.attributes
     );
-    vm::heap_allocator::init();
+    vm::hierarchical_heap_allocator::init();
     boot::init();
     vm::init();
     trap::init();

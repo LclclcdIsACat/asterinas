@@ -3,54 +3,45 @@
 use alloc::vec::Vec;
 
 use align_ext::AlignExt;
-use buddy_system_allocator::FrameAllocator;
 use log::info;
 use spin::Once;
 
-use super::{frame::VmFrameFlags, VmFrame, VmFrameVec, VmSegment};
+use super::{
+    frame::VmFrameFlags, hierarchical_frame_allocator::HierarchicalFrameAllocator, VmFrame,
+    VmFrameVec, VmSegment,
+};
 use crate::{
     boot::memory_region::{MemoryRegion, MemoryRegionType},
     config::PAGE_SIZE,
-    sync::SpinLock,
 };
 
-pub(super) static FRAME_ALLOCATOR: Once<SpinLock<FrameAllocator>> = Once::new();
+pub(super) static FRAME_ALLOCATOR: Once<HierarchicalFrameAllocator> = Once::new();
 
 pub(crate) fn alloc(nframes: usize, flags: VmFrameFlags) -> Option<VmFrameVec> {
-    FRAME_ALLOCATOR
-        .get()
-        .unwrap()
-        .lock()
-        .alloc(nframes)
-        .map(|start| {
-            let mut vector = Vec::new();
-            // Safety: The frame index is valid.
-            unsafe {
-                for i in 0..nframes {
-                    let frame = VmFrame::new(
-                        (start + i) * PAGE_SIZE,
-                        flags.union(VmFrameFlags::NEED_DEALLOC),
-                    );
-                    vector.push(frame);
-                }
+    FRAME_ALLOCATOR.get().unwrap().alloc(nframes).map(|start| {
+        let mut vector = Vec::new();
+        // Safety: The frame index is valid.
+        unsafe {
+            for i in 0..nframes {
+                let frame = VmFrame::new(
+                    (start + i) * PAGE_SIZE,
+                    flags.union(VmFrameFlags::NEED_DEALLOC),
+                );
+                vector.push(frame);
             }
-            VmFrameVec(vector)
-        })
+        }
+        VmFrameVec(vector)
+    })
 }
 
 pub(crate) fn alloc_single(flags: VmFrameFlags) -> Option<VmFrame> {
-    FRAME_ALLOCATOR.get().unwrap().lock().alloc(1).map(|idx|
+    FRAME_ALLOCATOR.get().unwrap().alloc(1).map(|idx|
             // Safety: The frame index is valid.
             unsafe { VmFrame::new(idx * PAGE_SIZE, flags.union(VmFrameFlags::NEED_DEALLOC)) })
 }
 
 pub(crate) fn alloc_contiguous(nframes: usize, flags: VmFrameFlags) -> Option<VmSegment> {
-    FRAME_ALLOCATOR
-        .get()
-        .unwrap()
-        .lock()
-        .alloc(nframes)
-        .map(|start|
+    FRAME_ALLOCATOR.get().unwrap().alloc(nframes).map(|start|
             // Safety: The range of page frames is contiguous and valid.
             unsafe {
             VmSegment::new(
@@ -68,7 +59,7 @@ pub(crate) fn alloc_contiguous(nframes: usize, flags: VmFrameFlags) -> Option<Vm
 /// User should ensure the index is valid
 ///
 pub(crate) unsafe fn dealloc_single(index: usize) {
-    FRAME_ALLOCATOR.get().unwrap().lock().dealloc(index, 1);
+    FRAME_ALLOCATOR.get().unwrap().dealloc(index, 1);
 }
 
 /// Deallocate a contiguous range of page frames.
@@ -78,15 +69,11 @@ pub(crate) unsafe fn dealloc_single(index: usize) {
 /// User should ensure the range of page frames is valid.
 ///
 pub(crate) unsafe fn dealloc_contiguous(start_index: usize, nframes: usize) {
-    FRAME_ALLOCATOR
-        .get()
-        .unwrap()
-        .lock()
-        .dealloc(start_index, nframes);
+    FRAME_ALLOCATOR.get().unwrap().dealloc(start_index, nframes);
 }
 
 pub(crate) fn init(regions: &[MemoryRegion]) {
-    let mut allocator = FrameAllocator::<32>::new();
+    let allocator = HierarchicalFrameAllocator::<32>::new();
     for region in regions.iter() {
         if region.typ() == MemoryRegionType::Usable {
             // Make the memory region page-aligned, and skip if it is too small.
@@ -103,5 +90,5 @@ pub(crate) fn init(regions: &[MemoryRegion]) {
             );
         }
     }
-    FRAME_ALLOCATOR.call_once(|| SpinLock::new(allocator));
+    FRAME_ALLOCATOR.call_once(|| allocator);
 }

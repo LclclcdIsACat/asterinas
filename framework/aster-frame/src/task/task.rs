@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use alloc::collections::BTreeMap;
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicU32, Ordering},
+};
+
 use intrusive_collections::{intrusive_adapter, LinkedListAtomicLink};
 
 use super::{
@@ -104,6 +110,7 @@ pub struct Task {
     data: Box<dyn Any + Send + Sync>,
     user_space: Option<Arc<UserSpace>>,
     task_inner: Mutex<TaskInner>,
+    task_id: TaskId,
     exit_code: usize,
     /// kernel stack, note that the top is SyscallFrame/TrapFrame
     kstack: KernelStack,
@@ -158,6 +165,10 @@ impl Task {
     /// Returns the task data.
     pub fn data(&self) -> &Box<dyn Any + Send + Sync> {
         &self.data
+    }
+
+    pub fn task_id(&self) -> TaskId {
+        self.task_id
     }
 
     /// Returns the user space of this task, if it has.
@@ -267,6 +278,7 @@ impl TaskOptions {
                 task_status: TaskStatus::Runnable,
                 ctx: TaskContext::default(),
             }),
+            task_id: allocate_taskid(),
             exit_code: 0,
             kstack: KernelStack::new_with_guard_page()?,
             link: LinkedListAtomicLink::new(),
@@ -304,6 +316,7 @@ impl TaskOptions {
                 task_status: TaskStatus::Runnable,
                 ctx: TaskContext::default(),
             }),
+            task_id: allocate_taskid(),
             exit_code: 0,
             kstack: KernelStack::new_with_guard_page()?,
             link: LinkedListAtomicLink::new(),
@@ -319,5 +332,71 @@ impl TaskOptions {
         let arc_self = Arc::new(result);
         arc_self.run();
         Ok(arc_self)
+    }
+}
+
+pub type TaskId = u32;
+
+static TASKID_ALLOCATOR: AtomicU32 = AtomicU32::new(0);
+
+fn allocate_taskid() -> TaskId {
+    TASKID_ALLOCATOR.fetch_add(1, Ordering::SeqCst)
+}
+
+pub struct PerTaskMap<T> {
+    map: UnsafeCell<BTreeMap<TaskId, T>>,
+}
+
+impl<T> PerTaskMap<T> {
+    pub const fn new() -> Self {
+        Self {
+            map: UnsafeCell::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn local_exists(&self) -> bool {
+        let task_id = current_task().unwrap().task_id();
+        let map = self.map();
+        map.contains_key(&task_id)
+    }
+
+    pub fn local_insert(&self, item: T) {
+        let task_id = current_task().unwrap().task_id();
+        let map = self.mut_map();
+        map.insert(task_id, item);
+    }
+
+    /// Gets an immutable reference to an object of current task.
+    ///
+    /// The user must ensure that the object exists
+    pub fn local(&self) -> &T {
+        let task_id = current_task().unwrap().task_id();
+        let map = self.map();
+        map.get(&task_id).unwrap()
+    }
+
+    /// Gets an mutable reference to an object of current task.
+    ///
+    /// The user must ensure that the object exists
+    pub fn local_mut(&self) -> &mut T {
+        let task_id = current_task().unwrap().task_id();
+        let map = self.mut_map();
+        map.get_mut(&task_id).unwrap()
+    }
+
+    pub fn remove(&self) {
+        let task_id = current_task().unwrap().task_id();
+        let map = self.mut_map();
+        map.remove(&task_id);
+    }
+
+    fn mut_map(&self) -> &mut BTreeMap<TaskId, T> {
+        // Safety: Different TaskId are indexed with different TaskId to avoid competition
+        unsafe { &mut *self.map.get() }
+    }
+
+    fn map(&self) -> &BTreeMap<TaskId, T> {
+        // Safety: Different TaskId are indexed with different TaskId to avoid competition
+        unsafe { &mut *self.map.get() }
     }
 }
