@@ -2,16 +2,13 @@
 
 use core::ops::Range;
 
-use aster_frame::vm::{VmFrame, VmFrameVec, VmIo, VmMapOptions, VmPerm, VmSpace};
+use align_ext::AlignExt;
+use aster_frame::vm::{VmAllocOptions, VmFrame, VmFrameVec, VmIo, VmMapOptions, VmPerm, VmSpace};
 
-use super::{interval::Interval, is_intersected, Vmar, Vmar_};
+use super::{get_intersected_range, interval::Interval, is_intersected, Vmar, Vmar_};
 use crate::{
     prelude::*,
-    vm::{
-        perms::VmPerms,
-        vmar::Rights,
-        vmo::{get_page_idx_range, Vmo, VmoChildOptions, VmoRightsOp},
-    },
+    vm::{get_aligned_addr_range, get_page_idx_range, pager::Pager, perms::VmPerms, vmar::Rights},
 };
 
 /// A VmMapping represents mapping a vmo into a vmar.
@@ -20,41 +17,52 @@ use crate::{
 /// The reltionship between Vmar and Vmo is M:N.
 pub struct VmMapping {
     inner: Mutex<VmMappingInner>,
+    backend: Option<VmMappingBackend>,
     /// The parent vmar. The parent should always point to a valid vmar.
     parent: Weak<Vmar_>,
-    /// The mapped vmo. The mapped vmo is with dynamic capability.
-    vmo: Vmo<Rights>,
 }
 
 impl VmMapping {
     pub fn try_clone(&self) -> Result<Self> {
         let inner = self.inner.lock().clone();
-        let vmo = self.vmo.dup()?;
         Ok(Self {
             inner: Mutex::new(inner),
+            backend: self.backend.clone(),
             parent: self.parent.clone(),
-            vmo,
         })
     }
 }
 
 #[derive(Clone)]
 struct VmMappingInner {
-    /// The map offset of the vmo, in bytes.
-    vmo_offset: usize,
     /// The size of mapping, in bytes. The map size can even be larger than the size of vmo.
     /// Those pages outside vmo range cannot be read or write.
     map_size: usize,
     /// The base address relative to the root vmar where the vmo is mapped.
     map_to_addr: Vaddr,
-    /// is destroyed
-    is_destroyed: bool,
-    /// The pages already mapped. The key is the page index in vmo.
-    mapped_pages: BTreeSet<usize>,
-    /// The permission of each page. The key is the page index in vmo.
+    /// The pages already mapped. The key is the vaddr.
+    /// TODO: it is more reasonable to index using virtual page frame numbers(VPNs) here.
+    /// However, we currently do not have an abstraction of VPNs.
+    mapped_pages: BTreeSet<Vaddr>,
+    /// The permission of each page. The key is the vaddr.
     /// This map can be filled when mapping a vmo to vmar and can be modified when call mprotect.
     /// We keep the options in case the page is not committed(or create copy on write mappings) and will further need these options.
-    page_perms: BTreeMap<usize, VmPerm>,
+    /// TODO: it is more reasonable to index using virtual page frame numbers(VPNs) here.
+    /// However, we currently do not have an abstraction of VPNs.
+    page_perms: BTreeMap<Vaddr, VmPerm>,
+
+    flag: VmMappingFlags,
+}
+
+bitflags! {
+    /// Vm_mapping flags.
+    pub struct VmMappingFlags: u32 {
+        /// Set this flag if a mapping is destroyed.
+        const DESTROYED  = 1 << 0;
+
+        /// Set this flag if a mapping is a copy-on-write mapping.
+        const COW = 1 << 1;
+    }
 }
 
 impl Interval<usize> for Arc<VmMapping> {
@@ -64,26 +72,20 @@ impl Interval<usize> for Arc<VmMapping> {
 }
 
 impl VmMapping {
-    pub fn build_mapping<R1, R2>(option: VmarMapOptions<R1, R2>) -> Result<Self> {
+    pub fn build_mapping<R1>(option: VmarMapOptions<R1>) -> Result<Self> {
         let VmarMapOptions {
             parent,
-            vmo,
             perms,
-            vmo_offset,
+            backend_offset,
             size,
             offset,
             align,
             can_overwrite,
+            pager,
         } = option;
         let Vmar(parent_vmar, _) = parent;
-        let vmo_size = vmo.size();
-        let map_to_addr = parent_vmar.allocate_free_region_for_vmo(
-            vmo_size,
-            size,
-            offset,
-            align,
-            can_overwrite,
-        )?;
+        let map_to_addr =
+            parent_vmar.allocate_free_region_for_vmo(size, offset, align, can_overwrite)?;
         trace!(
             "build mapping, map_range = 0x{:x}- 0x{:x}",
             map_to_addr,
@@ -93,38 +95,41 @@ impl VmMapping {
         let page_perms = {
             let mut page_perms = BTreeMap::new();
             let perm = VmPerm::from(perms);
-            let page_idx_range = get_page_idx_range(&(vmo_offset..vmo_offset + size));
-            for page_idx in page_idx_range {
-                page_perms.insert(page_idx, perm);
+            let map_addr_range = get_aligned_addr_range(&(map_to_addr..map_to_addr + size));
+            for map_addr in map_addr_range.step_by(PAGE_SIZE) {
+                page_perms.insert(map_addr, perm);
             }
             page_perms
         };
 
         let vm_mapping_inner = VmMappingInner {
-            vmo_offset,
             map_size: size,
             map_to_addr,
-            is_destroyed: false,
             mapped_pages: BTreeSet::new(),
             page_perms,
+            flag: VmMappingFlags::empty(),
+        };
+
+        let backend = {
+            if let Some(pager) = pager {
+                Some(VmMappingBackend::new(pager, backend_offset))
+            } else {
+                None
+            }
         };
 
         Ok(Self {
             inner: Mutex::new(vm_mapping_inner),
             parent: Arc::downgrade(&parent_vmar),
-            vmo: vmo.to_dyn(),
+            backend,
         })
-    }
-
-    pub fn vmo(&self) -> &Vmo<Rights> {
-        &self.vmo
     }
 
     /// Add a new committed page and map it to vmspace. If copy on write is set, it's allowed to unmap the page at the same address.
     /// FIXME: This implementation based on the truth that we map one page at a time. If multiple pages are mapped together, this implementation may have problems
     pub(super) fn map_one_page(
         &self,
-        page_idx: usize,
+        map_addr: Vaddr,
         frame: VmFrame,
         is_readonly: bool,
     ) -> Result<()> {
@@ -132,14 +137,14 @@ impl VmMapping {
         let vm_space = parent.vm_space();
         self.inner
             .lock()
-            .map_one_page(&self.vmo, vm_space, page_idx, frame, is_readonly)
+            .map_one_page(vm_space, map_addr, frame, is_readonly)
     }
 
     /// unmap a page
-    pub(super) fn unmap_one_page(&self, page_idx: usize) -> Result<()> {
+    pub(super) fn unmap_one_page(&self, map_addr: Vaddr) -> Result<()> {
         let parent = self.parent.upgrade().unwrap();
         let vm_space = parent.vm_space();
-        self.inner.lock().unmap_one_page(vm_space, page_idx)
+        self.inner.lock().unmap_one_page(vm_space, map_addr)
     }
 
     /// the mapping's start address
@@ -152,57 +157,53 @@ impl VmMapping {
         self.inner.lock().map_size
     }
 
-    /// the vmo_offset
-    pub fn vmo_offset(&self) -> usize {
-        self.inner.lock().vmo_offset
-    }
-    pub fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
-        let vmo_read_offset = self.vmo_offset() + offset;
-
+    pub fn can_read_bytes(&self, read_addr: Vaddr, len: usize) -> Result<()> {
         // TODO: the current logic is vulnerable to TOCTTOU attack, since the permission may change after check.
-        let page_idx_range = get_page_idx_range(&(vmo_read_offset..vmo_read_offset + buf.len()));
+        let aligned_addr_range = get_aligned_addr_range(&(read_addr..read_addr + len));
         let read_perm = VmPerm::R;
-        for page_idx in page_idx_range {
-            self.check_perm(&page_idx, &read_perm)?;
+        for page_addr in aligned_addr_range.step_by(PAGE_SIZE) {
+            self.check_perm(&page_addr, &read_perm)?;
         }
-
-        self.vmo.read_bytes(vmo_read_offset, buf)?;
         Ok(())
     }
 
-    pub fn write_bytes(&self, offset: usize, buf: &[u8]) -> Result<()> {
-        let vmo_write_offset = self.vmo_offset() + offset;
-
-        let page_idx_range = get_page_idx_range(&(vmo_write_offset..vmo_write_offset + buf.len()));
+    pub fn can_write_bytes(&self, write_addr: Vaddr, len: usize) -> Result<()> {
+        let aligned_addr_range = get_aligned_addr_range(&(write_addr..write_addr + len));
         let write_perm = VmPerm::W;
-        for page_idx in page_idx_range {
-            self.check_perm(&page_idx, &write_perm)?;
+        for page_addr in aligned_addr_range.step_by(PAGE_SIZE) {
+            self.check_perm(&page_addr, &write_perm)?;
         }
-
-        self.vmo.write_bytes(vmo_write_offset, buf)?;
         Ok(())
     }
 
     /// Unmap pages in the range
-    pub fn unmap(&self, range: &Range<usize>, may_destroy: bool) -> Result<()> {
+    pub fn unmap(&self, addr_range: &Range<usize>, may_destroy: bool) -> Result<()> {
+        let addr_range = get_intersected_range(addr_range, &self.range());
         let parent = self.parent.upgrade().unwrap();
         let vm_space = parent.vm_space();
-        self.inner.lock().unmap(vm_space, range, may_destroy)
+        self.inner.lock().unmap(vm_space, &addr_range, may_destroy)
     }
 
-    pub fn unmap_and_decommit(&self, range: Range<usize>) -> Result<()> {
-        self.unmap(&range, false)?;
-        let vmo_range = {
-            let map_to_addr = self.map_to_addr();
-            let vmo_offset = self.vmo_offset();
-            (range.start - map_to_addr + vmo_offset)..(range.end - map_to_addr + vmo_offset)
+    pub fn unmap_and_decommit(&self, addr_range: Range<usize>) -> Result<()> {
+        let addr_range = get_intersected_range(&addr_range, &self.range());
+        self.unmap(&addr_range, false)?;
+        if let Some(backend) = self.backend {
+            let decommit_range = {
+                let map_to_addr = self.map_to_addr();
+                let backend_offset = backend.offset();
+                (addr_range.start - map_to_addr + backend_offset)
+                    ..(addr_range.end - map_to_addr + backend_offset)
+            };
+            let page_idx_range = get_page_idx_range(&decommit_range);
+            for page_idx in page_idx_range {
+                backend.pager().decommit_page(page_idx);
+            }
         };
-        self.vmo.decommit(vmo_range)?;
         Ok(())
     }
 
     pub fn is_destroyed(&self) -> bool {
-        self.inner.lock().is_destroyed
+        self.inner.lock().flag.contains(VmMappingFlags::DESTROYED)
     }
 
     pub fn handle_page_fault(
@@ -211,61 +212,65 @@ impl VmMapping {
         not_present: bool,
         write: bool,
     ) -> Result<()> {
-        let vmo_offset = self.vmo_offset() + page_fault_addr - self.map_to_addr();
-        if vmo_offset >= self.vmo.size() {
-            return_errno_with_message!(Errno::EACCES, "page fault addr is not backed up by a vmo");
+        let map_offset = page_fault_addr - self.map_to_addr();
+        let aligned_fault_addr = page_fault_addr.align_down(PAGE_SIZE);
+        if map_offset >= self.map_size() {
+            return_errno_with_message!(Errno::EACCES, "page fault addr is not mapped.");
         }
-        let page_idx = vmo_offset / PAGE_SIZE;
         if write {
-            self.vmo.check_rights(Rights::WRITE)?;
+            self.check_rights(Rights::WRITE)?;
         } else {
-            self.vmo.check_rights(Rights::READ)?;
+            self.check_rights(Rights::READ)?;
         }
 
         let required_perm = if write { VmPerm::W } else { VmPerm::R };
-        self.check_perm(&page_idx, &required_perm)?;
+        self.check_perm(&aligned_fault_addr, &required_perm)?;
 
-        let frame = self.vmo.get_committed_frame(page_idx, write)?;
+        let frame = {
+            match &self.backend {
+                None => VmAllocOptions::new(1).alloc_single()?,
+                Some(backend) => backend
+                    .pager()
+                    .commit_page((backend.offset() + map_offset) / PAGE_SIZE)?,
+            }
+        };
 
         // If read access to cow vmo triggers page fault, the map should be readonly.
         // If user next tries to write to the frame, another page fault will be triggered.
-        let is_readonly = self.vmo.is_cow_child() && !write;
-        self.map_one_page(page_idx, frame, is_readonly)
+        let is_readonly = self.inner.lock().flag.contains(VmMappingFlags::COW) && !write;
+        self.map_one_page(aligned_fault_addr, frame, is_readonly)
     }
 
     pub(super) fn protect(&self, perms: VmPerms, range: Range<usize>) -> Result<()> {
         let rights = Rights::from(perms);
-        self.vmo().check_rights(rights)?;
+        self.check_rights(rights)?;
         let vmar = self.parent.upgrade().unwrap();
         let vm_space = vmar.vm_space();
         self.inner.lock().protect(vm_space, perms, range)
     }
 
     pub(super) fn new_cow(&self, new_parent: &Arc<Vmar_>) -> Result<VmMapping> {
-        let VmMapping { inner, vmo, .. } = self;
-
-        let child_vmo = {
-            let parent_vmo = vmo.dup().unwrap();
-            let vmo_size = parent_vmo.size();
-            VmoChildOptions::new_cow(parent_vmo, 0..vmo_size).alloc()?
-        };
+        let VmMapping { inner, backend, .. } = self;
 
         let new_inner = {
-            let inner = self.inner.lock();
+            let mut inner = self.inner.lock();
+            inner.flag |= VmMappingFlags::COW;
             VmMappingInner {
-                vmo_offset: inner.vmo_offset,
                 map_size: inner.map_size,
                 map_to_addr: inner.map_to_addr,
-                is_destroyed: inner.is_destroyed,
                 mapped_pages: BTreeSet::new(),
                 page_perms: inner.page_perms.clone(),
+                flag: inner.flag,
             }
         };
 
+        let vmar = self.parent.upgrade().unwrap();
+        let vm_space = vmar.vm_space();
+
         Ok(VmMapping {
             inner: Mutex::new(new_inner),
+            backend: backend.clone(),
             parent: Arc::downgrade(new_parent),
-            vmo: child_vmo,
         })
     }
 
@@ -340,23 +345,28 @@ impl VmMapping {
     fn check_perm(&self, page_idx: &usize, perm: &VmPerm) -> Result<()> {
         self.inner.lock().check_perm(page_idx, perm)
     }
+
+    fn check_rights(&self, rights: Rights) -> Result<()> {
+        match &self.pager {
+            None => Ok(()),
+            Some(pager) => pager.check_rights(rights),
+        }
+    }
 }
 
 impl VmMappingInner {
     fn map_one_page(
         &mut self,
-        vmo: &Vmo<Rights>,
         vm_space: &VmSpace,
-        page_idx: usize,
+        map_addr: Vaddr,
         frame: VmFrame,
         is_readonly: bool,
     ) -> Result<()> {
-        let map_addr = self.page_map_addr(page_idx);
+        let map_addr = map_addr.align_down(PAGE_SIZE);
 
         let vm_perm = {
             let mut perm = *self.page_perms.get(&page_idx).unwrap();
             if is_readonly {
-                debug_assert!(vmo.is_cow_child());
                 perm -= VmPerm::W;
             }
             perm
@@ -370,7 +380,7 @@ impl VmMappingInner {
         };
 
         // cow child allows unmapping the mapped page
-        if vmo.is_cow_child() && vm_space.is_mapped(map_addr) {
+        if self.flag.contains(VmMappingFlags::COW) && vm_space.is_mapped(map_addr) {
             vm_space.unmap(&(map_addr..(map_addr + PAGE_SIZE))).unwrap();
         }
 
@@ -379,33 +389,33 @@ impl VmMappingInner {
         Ok(())
     }
 
-    fn unmap_one_page(&mut self, vm_space: &VmSpace, page_idx: usize) -> Result<()> {
-        let map_addr = self.page_map_addr(page_idx);
+    fn unmap_one_page(&mut self, vm_space: &VmSpace, map_addr: Vaddr) -> Result<()> {
+        let map_addr = map_addr.align_down(PAGE_SIZE);
         let range = map_addr..(map_addr + PAGE_SIZE);
         if vm_space.is_mapped(map_addr) {
             vm_space.unmap(&range)?;
         }
-        self.mapped_pages.remove(&page_idx);
+        self.mapped_pages.remove(&map_addr);
         Ok(())
     }
 
     /// Unmap pages in the range
-    fn unmap(&mut self, vm_space: &VmSpace, range: &Range<usize>, may_destroy: bool) -> Result<()> {
-        let map_to_addr = self.map_to_addr;
-        let vmo_map_range = (range.start - map_to_addr + self.vmo_offset)
-            ..(range.end - map_to_addr + self.vmo_offset);
-        let page_idx_range = get_page_idx_range(&vmo_map_range);
-        for page_idx in page_idx_range {
-            self.unmap_one_page(vm_space, page_idx)?;
+    fn unmap(
+        &mut self,
+        vm_space: &VmSpace,
+        addr_range: &Range<usize>,
+        may_destroy: bool,
+    ) -> Result<()> {
+        let map_start = addr_range.start.align_down(PAGE_SIZE);
+        let map_end = addr_range.end.align_up(PAGE_SIZE);
+
+        for map_addr in (map_start..map_end).step_by(PAGE_SIZE) {
+            self.unmap_one_page(vm_space, map_addr)?;
         }
-        if may_destroy && *range == self.range() {
-            self.is_destroyed = false;
+        if may_destroy && *addr_range == self.addr_range() {
+            self.flag.remove(VmMappingFlags::DESTROYED);
         }
         Ok(())
-    }
-
-    fn page_map_addr(&self, page_idx: usize) -> usize {
-        page_idx * PAGE_SIZE - self.vmo_offset + self.map_to_addr
     }
 
     pub(super) fn protect(
@@ -416,12 +426,10 @@ impl VmMappingInner {
     ) -> Result<()> {
         debug_assert!(range.start % PAGE_SIZE == 0);
         debug_assert!(range.end % PAGE_SIZE == 0);
-        let start_page = (range.start - self.map_to_addr + self.vmo_offset) / PAGE_SIZE;
-        let end_page = (range.end - self.map_to_addr + self.vmo_offset) / PAGE_SIZE;
+        let addr_range = get_aligned_addr_range(&range);
         let perm = VmPerm::from(perms);
-        for page_idx in start_page..end_page {
-            self.page_perms.insert(page_idx, perm);
-            let page_addr = self.page_map_addr(page_idx);
+        for addr in addr_range {
+            self.page_perms.insert(addr, perm);
             if vm_space.is_mapped(page_addr) {
                 // if the page is already mapped, we will modify page table
                 let perm = VmPerm::from(perms);
@@ -493,50 +501,58 @@ impl VmMappingInner {
     }
 }
 
+#[derive(Clone)]
+struct VmMappingBackend {
+    pager: Arc<dyn Pager>,
+    offset: usize,
+}
+
+impl VmMappingBackend {
+    pub fn new(pager: Arc<dyn Pager>, offset: usize) -> Self {
+        Self { pager, offset }
+    }
+
+    pub fn pager(&self) -> Arc<dyn Pager> {
+        self.pager
+    }
+
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+}
+
 /// Options for creating a new mapping. The mapping is not allowed to overlap
 /// with any child VMARs. And unless specified otherwise, it is not allowed
 /// to overlap with any existing mapping, either.
-pub struct VmarMapOptions<R1, R2> {
-    parent: Vmar<R1>,
-    vmo: Vmo<R2>,
+pub struct VmarMapOptions<R> {
+    parent: Vmar<R>,
     perms: VmPerms,
-    vmo_offset: usize,
+    backend_offset: usize,
     size: usize,
     offset: Option<usize>,
     align: usize,
     can_overwrite: bool,
+    pager: Option<Arc<dyn Pager>>,
 }
 
-impl<R1, R2> VmarMapOptions<R1, R2> {
+impl<R> VmarMapOptions<R> {
     /// Creates a default set of options with the VMO and the memory access
     /// permissions.
     ///
     /// The VMO must have access rights that correspond to the memory
     /// access permissions. For example, if `perms` contains `VmPerm::Write`,
     /// then `vmo.rights()` should contain `Rights::WRITE`.
-    pub fn new(parent: Vmar<R1>, vmo: Vmo<R2>, perms: VmPerms) -> Self {
-        let size = vmo.size();
+    pub fn new(parent: Vmar<R>, size: usize, perms: VmPerms) -> Self {
         Self {
             parent,
-            vmo,
             perms,
-            vmo_offset: 0,
+            backend_offset: 0,
             size,
             offset: None,
             align: PAGE_SIZE,
             can_overwrite: false,
+            pager: None,
         }
-    }
-
-    /// Sets the offset of the first memory page in the VMO that is to be
-    /// mapped into the VMAR.
-    ///
-    /// The offset must be page-aligned and within the VMO.
-    ///
-    /// The default value is zero.
-    pub fn vmo_offset(mut self, offset: usize) -> Self {
-        self.vmo_offset = offset;
-        self
     }
 
     /// Sets the size of the mapping.
@@ -594,6 +610,16 @@ impl<R1, R2> VmarMapOptions<R1, R2> {
         self
     }
 
+    pub fn pager(mut self, pager: Arc<dyn Pager>) -> Self {
+        self.pager = Some(pager);
+        self
+    }
+
+    pub fn backend_offset(mut self, backend_offset: usize) -> Self {
+        self.backend_offset = offset;
+        self
+    }
+
     /// Creates the mapping.
     ///
     /// All options will be checked at this point.
@@ -602,7 +628,6 @@ impl<R1, R2> VmarMapOptions<R1, R2> {
     pub fn build(self) -> Result<Vaddr> {
         self.check_options()?;
         let parent_vmar = self.parent.0.clone();
-        let vmo_ = self.vmo.0.clone();
         let vm_mapping = Arc::new(VmMapping::build_mapping(self)?);
         let map_to_addr = vm_mapping.map_to_addr();
         parent_vmar.add_mapping(vm_mapping);
@@ -617,26 +642,22 @@ impl<R1, R2> VmarMapOptions<R1, R2> {
         if self.align % PAGE_SIZE != 0 || !self.align.is_power_of_two() {
             return_errno_with_message!(Errno::EINVAL, "invalid align");
         }
-        debug_assert!(self.vmo_offset % self.align == 0);
-        if self.vmo_offset % self.align != 0 {
-            return_errno_with_message!(Errno::EINVAL, "invalid vmo offset");
-        }
         if let Some(offset) = self.offset {
             debug_assert!(offset % self.align == 0);
             if offset % self.align != 0 {
                 return_errno_with_message!(Errno::EINVAL, "invalid offset");
             }
         }
-        self.check_perms()?;
+        //self.check_perms()?;
         self.check_overwrite()?;
         Ok(())
     }
 
-    /// check whether the vmperm is subset of vmo rights
-    fn check_perms(&self) -> Result<()> {
-        let perm_rights = Rights::from(self.perms);
-        self.vmo.check_rights(perm_rights)
-    }
+    // /// check whether the vmperm is subset of vmo rights
+    // fn check_perms(&self) -> Result<()> {
+    //     let perm_rights = Rights::from(self.perms);
+    //     self.vmo.check_rights(perm_rights)
+    // }
 
     /// check whether the vmo will overwrite with any existing vmo or vmar
     fn check_overwrite(&self) -> Result<()> {
@@ -656,11 +677,9 @@ impl<R1, R2> VmarMapOptions<R1, R2> {
             return Ok(());
         }
         let offset = self.offset.unwrap();
-        // we should spare enough space at least for the whole vmo
-        let size = self.size.max(self.vmo.size());
-        let vmo_range = offset..(offset + size);
+        let map_range = offset..(offset + self.size);
         self.parent
             .0
-            .check_vmo_overwrite(vmo_range, self.can_overwrite)
+            .check_vmo_overwrite(map_range, self.can_overwrite)
     }
 }

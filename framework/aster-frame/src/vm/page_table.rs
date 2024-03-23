@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::{vec, vec::Vec};
-use core::{fmt::Debug, marker::PhantomData, mem::size_of};
+use core::{fmt::Debug, marker::PhantomData, mem::size_of, ops::Range};
 
 use log::trace;
 use pod::Pod;
@@ -342,6 +342,36 @@ impl<T: PageTableEntryTrait, M> PageTable<T, M> {
             };
         }
         Some(current)
+    }
+
+    pub unsafe fn walk_leaf_entry_with(&mut self, vaddr_range: Range<Vaddr>, action: F)
+    where
+        F: FnMut(&mut T),
+    {
+        let mut count = self.config.address_width as usize;
+
+        let start_addr = vaddr_range.start;
+        let end_addr = vaddr_range.end;
+
+        let mut current: &mut T = unsafe {
+            &mut *(paddr_to_vaddr(self.root_paddr + size_of::<T>() * T::page_index(vaddr, count))
+                as *mut T)
+        };
+
+        while count > 1 {
+            if current.flags().is_huge() {
+                break;
+            }
+            count -= 1;
+            debug_assert!(size_of::<T>() * (T::page_index(vaddr, count) + 1) <= PAGE_SIZE);
+            // Safety: The offset does not exceed the value of PAGE_SIZE.
+            // It only change the memory controlled by page table.
+            current = unsafe {
+                &mut *(paddr_to_vaddr(
+                    current.paddr() + size_of::<T>() * T::page_index(vaddr, count),
+                ) as *mut T)
+            };
+        }
     }
 
     /// Unmap `vaddr`.

@@ -12,7 +12,6 @@ use crate::prelude::*;
 
 mod dyn_cap;
 mod options;
-mod pager;
 mod static_cap;
 
 pub use options::{VmoChildOptions, VmoOptions};
@@ -365,13 +364,6 @@ impl<R> Vmo<R> {
     pub fn is_cow_child(&self) -> bool {
         self.0.inner.lock().is_cow_child()
     }
-}
-
-/// get the page index range that contains the offset range of vmo
-pub fn get_page_idx_range(vmo_offset_range: &Range<usize>) -> Range<usize> {
-    let start = vmo_offset_range.start.align_down(PAGE_SIZE);
-    let end = vmo_offset_range.end.align_up(PAGE_SIZE);
-    (start / PAGE_SIZE)..(end / PAGE_SIZE)
 }
 
 pub(super) fn get_inherited_frames_from_parent(

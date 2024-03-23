@@ -11,7 +11,7 @@ pub mod vm_mapping;
 use core::ops::Range;
 
 use align_ext::AlignExt;
-use aster_frame::vm::VmSpace;
+use aster_frame::vm::{VmIo, VmSpace};
 use aster_rights::Rights;
 
 use self::{
@@ -256,7 +256,6 @@ impl Vmar_ {
             return child_vmar.handle_page_fault(page_fault_addr, not_present, write);
         }
 
-        // FIXME: If multiple vmos are mapped to the addr, should we allow all vmos to handle page fault?
         if let Some(vm_mapping) = inner.vm_mappings.find_one(&page_fault_addr) {
             debug_assert!(is_intersected(
                 &vm_mapping.range(),
@@ -404,15 +403,15 @@ impl Vmar_ {
     }
 
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
-        let read_start = self.base + offset;
-        let read_end = buf.len() + read_start;
-        let read_range = read_start..read_end;
+        let read_start_addr = self.base + offset;
+        let read_end_addr = buf.len() + read_start_addr;
+        let read_range = read_start_addr..read_end_addr;
         // if the read range is in child vmar
         let inner = self.inner.lock();
         for child_vmar_ in inner.child_vmar_s.find(&read_range) {
             let child_vmar_range = child_vmar_.range();
-            if child_vmar_range.start <= read_start && read_end <= child_vmar_range.end {
-                let child_offset = read_start - child_vmar_range.start;
+            if child_vmar_range.start <= read_start_addr && read_end_addr <= child_vmar_range.end {
+                let child_offset = read_start_addr - child_vmar_range.start;
                 return child_vmar_.read(child_offset, buf);
             }
         }
@@ -420,9 +419,12 @@ impl Vmar_ {
         // if the read range is in mapped vmo
         for vm_mapping in inner.vm_mappings.find(&read_range) {
             let vm_mapping_range = vm_mapping.range();
-            if vm_mapping_range.start <= read_start && read_end <= vm_mapping_range.end {
-                let vm_mapping_offset = read_start - vm_mapping_range.start;
-                return vm_mapping.read_bytes(vm_mapping_offset, buf);
+            if vm_mapping_range.start <= read_start_addr && read_end_addr <= vm_mapping_range.end {
+                let vm_mapping_offset = read_start_addr - vm_mapping_range.start;
+                if vm_mapping.can_read_bytes(read_start_addr, buf.len()) {
+                    self.vm_space.read_bytes(read_start_addr, buf)
+                }
+                // return vm_mapping.read_bytes(vm_mapping_offset, buf);
             }
         }
 
@@ -431,23 +433,24 @@ impl Vmar_ {
     }
 
     pub fn write(&self, offset: usize, buf: &[u8]) -> Result<()> {
-        let write_start = self
+        let write_start_addr = self
             .base
             .checked_add(offset)
             .ok_or_else(|| Error::with_message(Errno::EFAULT, "Arithmetic Overflow"))?;
 
-        let write_end = buf
+        let write_end_addr = buf
             .len()
-            .checked_add(write_start)
+            .checked_add(write_start_addr)
             .ok_or_else(|| Error::with_message(Errno::EFAULT, "Arithmetic Overflow"))?;
-        let write_range = write_start..write_end;
+        let write_range = write_start_addr..write_end_addr;
 
         // if the write range is in child vmar
         let inner = self.inner.lock();
         for child_vmar_ in inner.child_vmar_s.find(&write_range) {
             let child_vmar_range = child_vmar_.range();
-            if child_vmar_range.start <= write_start && write_end <= child_vmar_range.end {
-                let child_offset = write_start - child_vmar_range.start;
+            if child_vmar_range.start <= write_start_addr && write_end_addr <= child_vmar_range.end
+            {
+                let child_offset = write_start_addr - child_vmar_range.start;
                 return child_vmar_.write(child_offset, buf);
             }
         }
@@ -455,9 +458,12 @@ impl Vmar_ {
         // if the write range is in mapped vmo
         for vm_mapping in inner.vm_mappings.find(&write_range) {
             let vm_mapping_range = vm_mapping.range();
-            if vm_mapping_range.start <= write_start && write_end <= vm_mapping_range.end {
-                let vm_mapping_offset = write_start - vm_mapping_range.start;
-                return vm_mapping.write_bytes(vm_mapping_offset, buf);
+            if vm_mapping_range.start <= write_start_addr && write_end_addr <= vm_mapping_range.end
+            {
+                if vm_mapping.can_write_bytes(write_start_addr, buf.len()) {
+                    self.vm_space.write_bytes(write_start_addr, buf)
+                }
+                // return vm_mapping.write_bytes(vm_mapping_offset, buf);
             }
         }
 
@@ -586,14 +592,12 @@ impl Vmar_ {
 
     fn allocate_free_region_for_vmo(
         &self,
-        vmo_size: usize,
-        size: usize,
+        map_size: usize,
         offset: Option<usize>,
         align: usize,
         can_overwrite: bool,
     ) -> Result<Vaddr> {
-        trace!("allocate free region, vmo_size = 0x{:x}, map_size = 0x{:x}, offset = {:x?}, align = 0x{:x}, can_ovewrite = {}", vmo_size, size, offset, align, can_overwrite);
-        let map_size = size.max(vmo_size);
+        trace!("allocate free region, map_size = 0x{:x}, offset = {:x?}, align = 0x{:x}, can_ovewrite = {}", size, offset, align, can_overwrite);
 
         if can_overwrite {
             let mut inner = self.inner.lock();

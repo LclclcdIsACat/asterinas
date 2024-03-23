@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use aster_frame::vm::VmFrame;
+use aster_rights::Rights;
 
 use crate::prelude::*;
 
@@ -50,4 +51,6 @@ pub trait Pager: Send + Sync {
     /// such an assumption for its correctness; instead, it should simply ignore the
     /// call or return an error.
     fn decommit_page(&self, idx: usize) -> Result<()>;
+
+    fn check_rights(&self, rights: Rights) -> Result<()>;
 }

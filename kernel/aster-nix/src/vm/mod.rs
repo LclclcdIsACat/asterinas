@@ -16,7 +16,26 @@
 //! In Asterinas, VMARs and VMOs, as well as other capabilities, are implemented
 //! as zero-cost capabilities.
 
+use core::ops::Range;
+
+use aster_frame::config::PAGE_SIZE;
+
 pub mod page_fault_handler;
+mod pager;
 pub mod perms;
 pub mod vmar;
 pub mod vmo;
+
+/// Get the page index range from the byte range.
+pub fn get_page_idx_range(byte_range: &Range<usize>) -> Range<usize> {
+    let start = byte_range.start.align_down(PAGE_SIZE);
+    let end = byte_range.end.align_up(PAGE_SIZE);
+    (start / PAGE_SIZE)..(end / PAGE_SIZE)
+}
+
+/// Aligns the given address range to the page size boundaries.
+pub fn get_aligned_addr_range(addr_range: &Range<usize>) -> Range<usize> {
+    let start = addr_range.start.align_down(PAGE_SIZE);
+    let end = addr_range.end.align_up(PAGE_SIZE);
+    (start)..(end)
+}
