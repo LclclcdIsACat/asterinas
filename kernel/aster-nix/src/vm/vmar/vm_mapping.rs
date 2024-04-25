@@ -501,7 +501,9 @@ impl VmMappingInner {
             ..(range.end - map_to_addr + self.vmo_offset);
         let page_idx_range = get_page_idx_range(&vmo_map_range);
         for page_idx in page_idx_range {
-            self.unmap_one_page(vm_space, page_idx)?;
+            if self.mapped_pages.contains(&page_idx) {
+                self.unmap_one_page(vm_space, page_idx)?;
+            }
         }
         if may_destroy && *range == self.range() {
             self.is_destroyed = false;

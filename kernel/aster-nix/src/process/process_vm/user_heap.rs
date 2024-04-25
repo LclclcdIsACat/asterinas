@@ -15,7 +15,13 @@ use crate::{
 };
 
 pub const USER_HEAP_BASE: Vaddr = 0x0000_0000_1000_0000;
-pub const USER_HEAP_SIZE_LIMIT: usize = PAGE_SIZE * 1000;
+// TODO: Split this value into `USER_HEAP_INIT_SIZE` and `USER_HEAP_SIZE_LIMIT`.
+// `USER_HEAP_INIT_SIZE` should represent the initial heap size, while
+// `USER_HEAP_SIZE_LIMIT` should limit the maximum size of the heap (in fact, this
+// value should be retrieved from `ResourceLimits`). The reason this cannot currently
+// be done is because `VmMapping` cannot be resized, necessitating the establishment
+// of a sufficiently large mapping at the start.
+pub const USER_HEAP_SIZE_LIMIT: usize = PAGE_SIZE * 1000000;
 
 #[derive(Debug)]
 pub struct UserHeap {

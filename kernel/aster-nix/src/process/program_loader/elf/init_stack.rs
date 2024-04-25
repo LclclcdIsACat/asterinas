@@ -128,16 +128,15 @@ impl InitStack {
         ldso_load_info: &Option<LdsoLoadInfo>,
         aux_vec: &mut AuxVec,
     ) -> Result<()> {
-        self.map_and_zeroed(root_vmar)?;
+        self.map(root_vmar)?;
         self.write_stack_content(root_vmar, elf, ldso_load_info, aux_vec)?;
         self.debug_print_stack_content(root_vmar);
         Ok(())
     }
 
-    fn map_and_zeroed(&self, root_vmar: &Vmar<Full>) -> Result<()> {
+    fn map(&self, root_vmar: &Vmar<Full>) -> Result<()> {
         let vmo_options = VmoOptions::<Rights>::new(self.init_stack_size);
         let vmo = vmo_options.alloc()?;
-        vmo.clear(0..vmo.size())?;
         let perms = VmPerms::READ | VmPerms::WRITE;
         let vmar_map_options = root_vmar
             .new_map(vmo, perms)?
